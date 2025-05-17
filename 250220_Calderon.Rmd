@@ -1,0 +1,134 @@
+---
+title: "250220_Calderon"
+author: "Muhunden Jayakrishnan"
+date: "2/20/2025"
+output: html_document
+---
+
+Exploratory Deep Learning analyses of Calderon et al., 2023 Science 
+
+Objective : 1) Manipulate scRNAseq data to generate inputs for DL modelling
+            2) Compare NN architecture used in the manuscript against more complicated models
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+library(Seurat)
+library(patchwork)
+library(dplyr)
+library(SeuratData)
+```
+
+
+## Load data 
+
+Load data and generate folds for Deep Learning modelling.
+
+For this purpose, we will use the pre-generated Seurat object which has equally sampled # of cells within each time window. Equal sampling prevents modelling biases towards few more-abundant classes.
+
+```{r Data}
+
+rna_subsampled <- readRDS("./SeuratObjects/RNA/14912_29824_subsampled_large_checkpoint_endpoint.Rds")
+
+head(rna_subsampled@meta.data,n=10) ## Types of preexisting columns 
+
+head(rna_subsampled@assays$RNA@counts,n=20)[,1:30] ##example RNA counts for some cells 
+
+head(rna_subsampled@assays$RNA$data)  ## The data slot has depth normalized counts (as they are no longer integers!) 
+```
+Note that time column labels the original collection window -> We will use this information to generate the target variable (midpoint of each window) for modelling.
+
+We will use depth normalized counts as features. Feature scaling will be performed before training. 
+
+
+First verify if the RNA data is ordered correctly as the cell metadata labels.
+
+```{r}
+all(rna_subsampled@meta.data$cell == colnames(rna_subsampled@assays$RNA@data))
+
+```
+
+For modelling, we need to convert the Seurat object into a sparse-matrix containing relevant data.
+
+```{r}
+sparse_mat <- rna_subsampled@assays$RNA@data
+
+sparse_mat_center <- rna_subsampled@meta.data %>% mutate(start=as.numeric(gsub('_.+$', '', gsub('hrs_', '', time))),
+                                                          end=as.numeric(gsub('^.+_', '', gsub('hrs_', '', time))),
+                                                          center=(start+end) / 2) %>% select(cell, center, time)
+
+
+head(sparse_mat_center)
+```
+
+Feature selection : Remove low variance genes (preserving sparsity)
+
+```{r}
+
+sds_vals <- sparseMatrixStats::rowSds(sparse_mat)
+
+head(sds_vals)
+
+```
+
+Also note that they mapped to an extended reference list which also included transposable elements and other non-gene annotations. Standard RNA-seq is not appropriate for these quantifications, so remove these and retain only well annotated genes.
+
+```{r}
+
+all_genes <- rownames(sparse_mat)
+
+filtered_genes <- all_genes[which(sds_vals > 0 & !grepl('-transposable-element', all_genes) & !grepl('^FBti', all_genes))]
+
+summary(filtered_genes) 
+
+all(sparse_mat_center$cell == rownames(t(sparse_mat[filtered_genes,]))) ##sanity check 
+
+```
+We retain around 16k genes 
+
+Now generate 11-kfold sets of cells (10 folds for train-test and 11th fold will be for validation).
+Each fold will be stored as a .mtx sparse-matrix format which can be used in Python.
+```{r}
+k_folds <- 11 
+sparse_mat_center$kfold <- ggplot2::cut_number(sample(nrow(sparse_mat_center)),
+	k_folds, labels=1:k_folds)
+
+fold_dir <- "./k_folds_data/"
+
+if(!file.exists(fold_dir)){
+  dir.create(fold_dir)
+}
+
+## loop through folds and write sparse object and save center windows
+
+## transpose so features (genes) are columns and samples (cells) are rows
+for (a_fold in 1:length(unique(sparse_mat_center$kfold))) { # a_fold <- 1
+	print(paste0('working on fold: ', a_fold))
+	fold_cells <- sparse_mat_center %>% filter(kfold == a_fold)
+	Matrix::writeMM(obj = t(sparse_mat[filtered_genes, fold_cells$cell]),
+		file=paste0(fold_dir,a_fold, "_fold_rna.mtx"))
+	fold_cells %>% select(center, time, cell, kfold) %>%
+	    write.table(paste0(fold_dir,a_fold, "_fold_rna_centers.tsv"),
+			sep='\t', quote=F, col.names=F, row.names=F)
+}
+
+```
+ Now process the main Seurat dataset object (containing all cells from all expts) in the same way to exclude unnecessary genes and extract 'centers' of time windows.
+ 
+```{r}
+
+temp <- readRDS(file = "SeuratObjects/RNA/main.Rds")
+
+sparse_mat_full <- temp@assays$RNA@data
+sparse_mat_full_center <- temp@meta.data %>% mutate(start=as.numeric(gsub('_.+$', '', gsub('hrs_', '', time))),
+                                                    end=as.numeric(gsub('^.+_', '', gsub('hrs_', '', time))),
+                                                    center=(start+end) / 2) %>% select(cell, center, time)
+
+Matrix::writeMM(obj = t(sparse_mat_full[filtered_genes,]), file=paste0(fold_dir,"all_rna.mtx"))
+sparse_mat_full_center %>% 
+    write.table(paste0(fold_dir,"all_rna_centers.tsv"),
+	sep='\t', quote=F, col.names=F, row.names=F)
+
+```
+ 

@@ -1,0 +1,209 @@
+---
+title: "Seurat Exploratory Data Analyses"
+author: "Muhunden Jayakrishnan"
+date: "2/19/2025"
+output: html_document
+---
+
+# Installation of Seurat and dependencies
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#install.packages('Seurat')
+#devtools::install_github('satijalab/seurat-data')  ## Various example datasets
+
+
+#setRepositories(ind = 1:3, addURLs = c('https://satijalab.r-universe.dev', 'https://bnprks.r-universe.dev/'))
+#install.packages(c("BPCells", "presto", "glmGamPoi"))
+
+#if (!requireNamespace("remotes", quietly = TRUE)) {
+#  install.packages("remotes")
+#}
+#install.packages('Signac')
+#remotes::install_github("satijalab/seurat-data", quiet = TRUE)
+#remotes::install_github("satijalab/azimuth", quiet = TRUE)
+#remotes::install_github("satijalab/seurat-wrappers", quiet = TRUE)
+#install.packages("patchwork")
+
+library(Seurat)
+library(patchwork)
+library(dplyr)
+library(SeuratData)
+```
+
+## Datasets
+
+Cellranger (10x genomics) UMI Count output can be read in using a family of Read10X() functions and converted to SeuratObjects 
+
+For now, we use in built datasets from Seurat-Data : 14K PBMC cells (+/- IFNB)
+
+```{r DataSetup}
+AvailableData()
+
+InstallData("ifnb")
+data("ifnb")
+
+ifnb <- UpdateSeuratObject(ifnb)  ## Need this for newer versions
+ifnb
+```
+
+Explore structure of the dataset.
+
+Further, split the data into two 'layers'; one for Control cells and one for Unstimulated cells 
+```{r DataStr}
+
+head(ifnb$nCount_RNA) #Number of molecules per UMI
+
+ifnb@assays$RNA@counts[c("CD3D", "TCL1A", "MS4A1"), 1:30]  ### Use @ operator to extract counts layer -> This is the aggregated cellranger output in sparse mode
+
+ifnb[["RNA"]] <- split(ifnb[["RNA"]], f=ifnb$stim)     ## [["RNA"]] is equivalent to ifnb@assays$RNA
+ifnb@assays
+```
+
+Unlike bulk RNAseq analyses which involves calculation of library TMM 'scaling factors', single cell data uses error models to correct for biases like sequencing depth etc. This is implemented by SCTransform() function
+
+Summary : Detailed explanation here https://rawgit.com/ChristophH/sctransform/supp_html/supplement/variance_stabilizing_transformation.html
+
+Assuming that single-cell counts are poisson-distributed, mean counts (in the population of cells) must be equal to variance. Studies have demonstrated that for low-medium expressed genes, variance ~ mean but this deviates for higher expressed genes (more variance than expected -> overdispersion). 
+
+To correct for such biases, gene expression counts for a given cell is modelled as a negative binomial random variable. Regression is performed per gene basis including sequencing depth in the modelling. 
+
+One interesting example that they demonstrate is the effect on scTransform on a gene that exists in 2 states (on or off) in the cell population. Under standard conditions (Poisson), variance wouldve been overestimated and led to an 'overcorrection' while scTransform (Negative binomial) retains this complexity. -> These genes with high pearson residuals (.ie. expression counts deviating significantly from expected in the model) are the cluster markers !
+
+In addition to the standard transformation, you can provide other variables that you can 'regress' out -> Typically Mitochondrial genes (or housekeeping genes which are expected to be same between cells?)
+
+```{r scTransform}
+
+ifnb <- PercentageFeatureSet(ifnb,pattern="^MT-",col.name="percent.mt")
+
+ifnb_transf <- SCTransform(ifnb, vars.to.regress = "percent.mt", verbose=F)
+
+```
+
+Visualize (sc)transformed and untransformed data -> By default, UMAP is performed on the principal components produced from PCA -> Not necessary, but speedier and robust 
+tSNE is more sensititve to large # of data points, and definitely benefits from prior PCA
+
+Note : 'Un'-transformed data is still logNormalized assuming same library counts. Further, variableFeatures must be extracted and data must be scaled before PCA. In contrast, SCTransform does everything in a single command (in addition to the different transformation)
+
+```{r uMap_unTransf}
+ifnb <- NormalizeData(ifnb,normalization.method = "LogNormalize", scale.factor = 10000) 
+ifnb <- FindVariableFeatures(ifnb,selection.method = "vst",nfeatures=2000) 
+
+all.genes <- rownames(ifnb)
+ifnb <- ScaleData(ifnb,features = all.genes)
+
+ifnb <- RunPCA(ifnb,features = VariableFeatures(object=ifnb),verbose=F)
+ifnb <- RunUMAP(ifnb, dims=1:30,verbose=F)
+
+ifnb <- FindNeighbors(ifnb, dims = 1:30, verbose = FALSE)
+ifnb <- FindClusters(ifnb, verbose = FALSE)
+DimPlot(ifnb, label = TRUE)
+
+```
+```{r uMAP_transf}
+
+
+ifnb_transf <- RunPCA(ifnb_transf,verbose=F)
+ifnb_transf <- RunUMAP(ifnb_transf, dims=1:30,verbose=F)
+
+ifnb_transf <- FindNeighbors(ifnb_transf, dims = 1:30, verbose = FALSE)
+ifnb_transf <- FindClusters(ifnb_transf, verbose = FALSE)
+DimPlot(ifnb_transf, label = TRUE)
+
+saveRDS(ifnb_transf,file="ifnb_transf.rds")
+
+```
+We can observe that clusters are tighter with scTransform compared to standard pipeline. But overall data quality is pretty good even with standard pipeline.
+
+Use SCTransformed data for subsequent analyses. (IMPORTANT NOTE: SCTRANSFORM MAY INTRODUCE SOME REPORDUCIBILITY CONCERNS (SEE GITHUB DISCUSSIONS); HOWEVER STANDARD PIPELINE APPEARS TO BE SAFER*)
+
+
+Can also visualize top extracted PCs from PCA analyses -> These are the informative ones any may show cell type/treatment specific patterns.
+
+```{r}
+DimHeatmap(ifnb_transf, dims = 1:5, cells = 500, balanced = TRUE)
+
+```
+Some lowly expressed genes can influence PCs -> Consider prior feature selection 
+
+## Integration
+
+Now, note that we so far we have treated Control and Stimulated cells as a population together. Thats why we observe 20 clusters ! -> Some of these clusters are likely the same cell type but slightly differ based on a few genes upon IFN stimulation. 
+
+In this case, our goal is to first match the cell type in both populations (sc Integration), then differential testing can be performed within the same cluster to assess the effects of treatment. 
+
+
+```{r}
+DimPlot(ifnb_transf,reduction="umap",group.by = c("stim", "seurat_annotations"))
+
+```
+We already have annotations here, but we can see based on dominant expression patterns that some clusters are actually the same (CD4 Naive T for example is split as 7 and 1) -> We can integrate them to form a layered, celltype-matched umap 
+
+Note that layers have to be predefined (our first step!) before applying the integration
+
+```{r}
+ifnb_transf <- IntegrateLayers(object = ifnb_transf, method = CCAIntegration, normalization.method = "SCT", verbose = F)
+ifnb_transf <- FindNeighbors(ifnb_transf, reduction = "integrated.dr", dims = 1:30)
+ifnb_transf <- FindClusters(ifnb_transf, resolution = 0.6)
+
+ifnb_transf <- RunUMAP(ifnb_transf, dims = 1:30, reduction = "integrated.dr")
+DimPlot(ifnb_transf, reduction = "umap", group.by = c("stim", "seurat_annotations"))
+```
+Now you have cell-type matched UMAPs - Note that this is mainly for viz purposes -> It is not to demonstrate Treatment vs Control 
+
+```{r}
+DimPlot(ifnb_transf, reduction = "umap", split.by = "stim")
+
+```
+Differential testing BETWEEN treatments -> This can be performed on integrated layer provided you run PrepSCTFindMarkers before FindMarkers. Using this approach,
+SCT assay values (corrected counts) are used for DE testing. The use of SCT values as opposed to raw RNA counts is still a bit controversial. Test both approaches for concordance.
+
+Here differential expression between Control and Stimulated B cells are shown. Note that shown example ISG15 is NOT a B-cell specific increase.
+
+Note: FindMarkers belongs to a family of functions. Find Variable genes describing each cluster using FindMarkers -> DE analyses. This function allows selective comparison .i.e., Cluster 1 vs all ; Cluster 2 vs cluster3+4 etc. FindAllMarkers performs 1 vs all DE analyses for each cluster. FindMarkers allows different statistical tests. Default is Mann Whitney Test; another option is ROC showing classification power (0 is useless, 1 is most useful). Importantly, not all of them are valid on integrated datasets, so verify before usage !
+
+```{r}
+ifnb_transf <- PrepSCTFindMarkers(ifnb_transf)
+ifnb_transf$celltype.stim <- paste(ifnb_transf$seurat_annotations, ifnb_transf$stim, sep = "_")
+Idents(ifnb_transf) <- "celltype.stim"            #### Note that it is critical to switch Idents to what you want to compare before FindMarkers
+b.interferon.response <- FindMarkers(ifnb_transf, ident.1 = "B_STIM", ident.2 = "B_CTRL", verbose = FALSE)  #### Different Idents() can be used here. Cluster identity etc. 
+
+head(b.interferon.response) ## top 3 differentially expressed genes BETWEEN 
+
+b.interferon.response %>% filter (p_val_adj < 0.01, pct.1>0.1) %>% arrange(avg_log2FC,decreasing = T) %>% head(n=1) #downregulated marker - not many !
+
+
+FeaturePlot(ifnb_transf, features = c("ISG15", "CD3D", "CD79B"), split.by = "stim", max.cutoff = 3, cols = c("grey","red"), reduction = "umap")
+```
+
+Note that p-values obtained are artificially downflated (as every cell is treated as a replicate; cell-to-cell correlations can confound Ctl vs Treatment comparisons). This can lead to false positives. To verify substantial hits, perform pseudobulk analyses (see below)
+
+```{r}
+plots <- VlnPlot(ifnb_transf, features = c("ISG15", "CXCL10"), split.by = "stim",
+    group.by = "seurat_annotations", pt.size = 0, combine = FALSE)
+wrap_plots(plots = plots, ncol = 2)
+```
+
+Other optional calculations. Possibly better to run it on RNA counts instead of SCT values. 
+
+```{r}
+
+cluster1.markers <- FindMarkers(ifnb_transf, ident.1 = "CD14 Mono_CTRL")
+#cluster2_v45.markers <- FindMarkers(ifnb_transf,ident.1 = 2,ident.2 = c(4,5))
+
+#head(cluster1.markers)
+#head(cluster2_v45.markers)
+
+ifnb.markers <- FindAllMarkers(ifnb_transf,only.pos = TRUE)
+ifnb.markers_top <- ifnb.markers %>% group_by(cluster) %>% filter(avg_log2FC > 1) %>% slice_max(order_by=avg_log2FC,n=2)  ##select only top 2 markers per cluster (by lfc) and viz
+
+ifnb.markers_top
+
+```
+
+Now we aggregate RNA counts for each treatment-celltype pairs (.ie. 1 value for each cluster +/- stim ). If you have another layer of information (.ie. donor type), 
+then you can compare these values for each donor by statistical tests (.ie. if you have 8 donors, then 8 values for Ctl B cells and 8 values for Stimulated B cells - t-test!) -> Exercise for later !
+
+
+
