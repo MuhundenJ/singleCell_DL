@@ -3,5 +3,7 @@ TensorFlow Deep Learning Modelling of Single Cell data preprocessed using Seurat
 
 This repo contains two parts :
 
-1) Test exploration of Seurat features using toy single-cell RNAseq immunology datasets (250219_Tests.Rmd)
+1) Test exploration of Seurat features using toy single-cell RNAseq immunology datasets (250219_Tests.Rmd) : see Rmd file here    [
+](https://previewhtml.github.io/?url=https%3A%2F%2Fgithub.com%2FMuhundenJ%2FsingleCell_DL%2Fblob%2Fmain%2F250219_Seurat.html)
+
 2) Preprocessing of single-cell RNAseq data of Drosophila embryos during development using Seurat and Deep-Learning 'age' modelling using TensorFlow based on Calderon et al., 2022 (DOI: 10.1126/science.abn5800) (250220_Calderon.Rmd and age_model.ipynb)
